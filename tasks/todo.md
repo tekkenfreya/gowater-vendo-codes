@@ -203,3 +203,92 @@ Save / compile / upload to HMI.
 - NVS namespace `"sales"` is untouched. New namespace `"config"`.
 - No changes to HMI register layout, dispense logic, SMS code.
 - Web server is dormant during transactions to avoid SoftwareSerial/GSM timing glitches.
+
+---
+
+# Make PULSES_PER_LITER editable from HMI (water_vendo_vigan.ino)
+
+## Goal
+Operator changes flow calibration (pulses per liter) from a spare HMI **numeric input**
+bound to the 4x register mapping to firmware slot `address[24]`. No reflash. Survives reboot via NVS.
+User does the HMI side; ESP32 side only here. Minimal changes.
+
+## Tasks
+- [x] 1. Drop `const` on `PULSES_PER_LITER` (keep the name → all 6 usages unchanged)
+- [x] 2. Add `savePulsesPerLiter()` NVS helper (namespace `"config"`, key `ppl`)
+- [x] 3. `loadConfig()`: load saved value + push into `address[24]` so HMI shows current calibration on boot
+- [x] 4. Add `syncPulsesPerLiter()` — apply HMI-entered value, persist; ignore 0 (guards calibration + divide-by-zero)
+- [x] 5. Call `syncPulsesPerLiter()` in the `HMICon` poll loop
+
+## Notes
+- Value is integer `uint16_t` (450 fits). `!= 0` guard so idle/boot never zeroes calibration.
+- `regs` unchanged — slot 24 was the only free index.
+
+---
+
+# Admin free-dispense mode + 1 reserved slot (water_vendo_vigan.ino)
+
+## Goal
+Expand register array to add 2 slots. address[26] = admin free-dispense toggle
+(HMI: 1=on, 0=normal). When on, choosing a product dispenses free (no coins/GCash).
+address[27] = reserved for the next feature (spec pending). User does HMI side.
+
+## Tasks
+- [x] 1. Bump `regs` 26 -> 28 (slots 26, 27)
+- [x] 2. Default `address[26] = 0` in setup() (admin always OFF on boot — safety)
+- [x] 3. Dispatch: if `address[26]==1`, pre-credit `currency = prices[...]` so cashPay/gcashPay dispense immediately
+- [x] 4. Skip `recordSale()` when admin mode on (free pour not logged as a sale — keeps revenue accurate)
+- [ ] 5. address[27] feature — WAITING on user spec
+
+## Notes
+- One pre-credit covers both cash + GCash (both dispense once `currency >= price`).
+- `resetRegisters()` only clears 0-6, so admin toggle persists until HMI sets it back to 0.
+- HMI must still trigger the transaction (address[0]=1, address[2]=1 or 2) for the dispense to run.
+
+---
+
+# Water level sensor: pause dispense + "Refilling..." (water_vendo_v2.ino)
+
+## Wiring (new setup, confirmed 18 Aug 2026)
+GSM 16/17 · RS232/HMI 18/19 · coinslot 23 · slot relay 25 · booster relay 26 ·
+flow 27 · **water level LOW = 32, HIGH = 33** (new). Code pins already match except 32/33.
+
+## Behaviour (user spec)
+- If LOW sensor reads dry -> pause transaction, relay OFF, HMI shows "Refilling..."
+- Wait until HIGH sensor reads wet (hysteresis: don't resume at LOW, resume at HIGH)
+- Then resume dispense where it left off (pulse count kept), relay ON
+- Otherwise continue normally
+
+## Tasks
+- [x] 1. `#define levelLow 32`, `#define levelHigh 33`; `pinMode(..., INPUT_PULLUP)` in setup()
+- [x] 2. `#define LEVEL_DRY LOW` — one-line flip if float switches read inverted on hardware
+- [x] 3. `bool refilling` global + `checkTankLevel()`:
+       LOW dry -> refilling=true; HIGH wet -> refilling=false; mirror to `address[27]` (1 = refilling)
+- [x] 4. `unsigned long waitForRefill()` — relay LOW, loop until !refilling (calls checkTankLevel, delay 100), relay HIGH; returns paused ms
+- [x] 5. Call at top of the dispense `while` in cashPay() AND gcashPay():
+       if refilling -> pause; add paused ms to `dispenseStartTime` + reset `lastPulseTime` so stall / no-water timeouts don't fire after resume
+- [x] 6. Call `checkTankLevel()` once per `loop()` so HMI shows "Refilling..." while idle too
+- [ ] 7. HMI side (user): bind `4x0027` — show "Refilling..." when value == 1
+
+## Notes
+- address[27] was the reserved slot -> now the tank status flag. `regs = 28` already.
+- Uses HMICon task for polling, so HMI keeps updating during the wait.
+- Coin insertion is untouched: paying still works while low; pour just waits for refill.
+- Not doing: blocking a NEW transaction start while low (say if you want that).
+
+---
+
+# Code scan fixes (water_vendo_v2.ino) — 18 Aug 2026
+
+- [x] 1. REMOVED PayMongo SMS crediting (`extractAmount`, `testExtractAmount`, PAYMONGO branch). GCash credit will come from an API method later; `gcashPay()` kept as the placeholder.
+- [x] 2. Cancelled / failed transaction no longer recorded as a sale — `cashPay()` / `gcashPay()` now return `bool dispensed`; `loop()` records only when true.
+- [x] 3. `clearSales()` restores the 19L volume label (`address[20]`) after zeroing sales regs.
+- [ ] 4. Ghost credit — moot after #1 (no SMS credit source). Skipped.
+- [x] 5. Overpay shows 65535 on HMI — added `remainingBalance()` helper (clamps at 0), used at both `address[4]` sites in `cashPay()`.
+- [x] 6. Bounds-check `address[1]` at transaction start in `loop()` — invalid index → `resetRegisters()`, return.
+- [x] 7. `syncPulsesPerLiter()` moved from HMICon task to `loop()` (idle only) — single-task NVS access.
+- [ ] 8. GSM → HardwareSerial `Serial2` — DEFERRED (no benefit until GSM carries payments/API).
+
+> **18 Aug 2026:** all of the above (pin remap, editable PPL, admin mode, scan fixes,
+> tank level) now lives in **`water_vendo_v2.ino`** — the NEW vendo build.
+> `water_vendo_vigan.ino` was restored to the committed version (old vendo, HMI on 16/17).
