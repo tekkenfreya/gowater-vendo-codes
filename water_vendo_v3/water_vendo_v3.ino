@@ -19,9 +19,9 @@
 #define levelLow 32   // tank LOW float switch
 #define levelHigh 33  // tank HIGH float switch
 // Pin reading that means the water indicator is ON (= no water at that level).
-// Bench 18 Aug: it dispensed while both indicators were on with LOW here, so on
-// this hardware "on" reads HIGH. Flip back to LOW if the wiring changes.
-#define LEVEL_DRY HIGH
+// Indicators pull the pin LOW when on; idle/unconnected reads HIGH (pull-up).
+// Verified on bench 18 Aug 2026 (HIGH here blocked the machine at boot).
+#define LEVEL_DRY LOW
 
 // Slots 26 (admin free-dispense toggle) and 27 (tank refilling flag) added on top of the
 // original 0-25 HMI map. address[24]=calibration, address[25]=login.

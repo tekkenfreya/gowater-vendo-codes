@@ -294,3 +294,11 @@ flow 27 · **water level LOW = 32, HIGH = 33** (new). Code pins already match ex
 > **18 Aug 2026:** all of the above (pin remap, editable PPL, admin mode, scan fixes,
 > tank level) now lives in **`water_vendo_v3.ino`** — the NEW vendo build.
 > `water_vendo_vigan.ino` was restored to the committed version (old vendo, HMI on 16/17).
+
+> **18 Aug bench (ESP32 on USB, flashed from arduino-cli):** built with **ESP32 core 2.0.17**
+> (3.3.11 gave the "no WiFi light" report; unverified whether 3.x was actually the cause — the
+> 2.0.17 build boots with `AP started: GoWater-Vendo @ 192.168.4.1`). `LEVEL_DRY` is **LOW**:
+> indicators pull the pin low when on; HIGH blocked the machine at boot with pins idle.
+> GSM module not answering on the bench (no SIM / not wired) — expected.
+> Flash: `arduino-cli upload -p /dev/cu.usbserial-0001 --fqbn esp32:esp32:esp32 water_vendo_v3`
+> or the GoWater Flasher app.
