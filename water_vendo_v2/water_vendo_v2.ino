@@ -527,16 +527,18 @@ void loop()
     address[8] = 0;
   }
 
-  if (address[0] == 1)
+  // Guard: product index above NUM_PRODUCTS is garbage -> abort. address[1]==0
+  // just means the HMI started the flow (address[0]=1) but no product is chosen
+  // yet, so wait without touching anything.
+  if (address[0] == 1 && address[1] > NUM_PRODUCTS)
   {
-    // Guard: product index must be 1..NUM_PRODUCTS before indexing arrays.
-    if (address[1] < 1 || address[1] > NUM_PRODUCTS)
-    {
-      Serial.print("Invalid product index from HMI: ");
-      Serial.println(address[1]);
-      resetRegisters();
-      return;
-    }
+    Serial.print("Invalid product index from HMI: ");
+    Serial.println(address[1]);
+    resetRegisters();
+  }
+
+  if (address[0] == 1 && address[1] >= 1)
+  {
     Serial.print("Transaction triggered. address[1] = ");
     Serial.println(address[1]);
     address[4] = prices[address[1]];
