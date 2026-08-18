@@ -57,9 +57,12 @@ const String ADMIN_NUMBER_1 = "+639683597760";
 const String ADMIN_NUMBER_2 = ""; // TBA — fill in when available
 
 // ============ TANK LEVEL ============
-// refilling goes TRUE when the LOW sensor is dry, and back to FALSE only when the
-// HIGH sensor is wet (hysteresis). Mirrored to address[27] for the HMI:
+// refilling goes TRUE when the LOW indicator is on, and back to FALSE only when
+// the HIGH indicator is off (hysteresis). Mirrored to address[27] for the HMI:
 // 1 = show "Refilling...", 0 = normal.
+// While refilling: any running transaction is ABORTED (pump off, registers reset,
+// no sale recorded) and no new transaction can start. Once the tank reaches
+// HIGH the machine is back to normal and the customer triggers again.
 bool refilling = false;
 
 void checkTankLevel()
@@ -77,27 +80,6 @@ void checkTankLevel()
   address[27] = refilling ? 1 : 0;
 }
 
-// Called inside the dispense loop. If the tank is low: pump OFF, wait until the
-// HIGH sensor is wet, pump ON. Returns how long we paused (ms) so the caller can
-// push its timeouts forward. Returns 0 if no pause was needed.
-unsigned long waitForRefill()
-{
-  checkTankLevel();
-  if (!refilling)
-    return 0;
-
-  unsigned long pauseStart = millis();
-  digitalWrite(relay, LOW);
-  Serial.println("Dispense PAUSED - waiting for tank to refill");
-  while (refilling)
-  {
-    delay(100);
-    checkTankLevel();
-  }
-  digitalWrite(relay, HIGH);
-  Serial.println("Dispense RESUMED");
-  return millis() - pauseStart;
-}
 // ====================================
 
 // Flow sensor variables
@@ -344,8 +326,8 @@ String renderAdminPage(const String &message)
   html += "<button type='submit'>Save Products</button></form>";
 
   html += "<hr><form method='POST' action='/changepw'><h2>Change Admin Password</h2>";
-  html += "<label>New password (min 6 chars)</label>";
-  html += "<input type='password' name='newpw' minlength='6' required>";
+  html += "<label>New password (min 8 chars)</label>";
+  html += "<input type='password' name='newpw' minlength='8' required>";
   html += "<p style='font-size:0.9em;color:#666'>Note: this is also the WiFi password. After changing, reconnect using the new one.</p>";
   html += "<button type='submit'>Change Password</button></form>";
   html += "</body></html>";
@@ -426,9 +408,9 @@ void handleChangePassword()
     return;
   }
   String newpw = server.arg("newpw");
-  if (newpw.length() < 6)
+  if (newpw.length() < 8)
   {
-    server.send(200, "text/html", renderAdminPage("Password must be at least 6 characters."));
+    server.send(200, "text/html", renderAdminPage("Password must be at least 8 characters (WiFi WPA2 minimum)."));
     return;
   }
   adminPassword = newpw;
@@ -473,9 +455,15 @@ void setup()
   loadConfig();
   loadSales();
 
+  // WPA2 needs an 8+ char password or softAP() silently fails to start.
+  if (adminPassword.length() < 8)
+  {
+    Serial.println("Stored admin password shorter than 8 chars - AP falls back to default password.");
+    adminPassword = DEFAULT_ADMIN_PASSWORD;
+  }
   WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, adminPassword.c_str());
-  Serial.print("AP started: ");
+  bool apOK = WiFi.softAP(AP_SSID, adminPassword.c_str());
+  Serial.print(apOK ? "AP started: " : "AP FAILED to start: ");
   Serial.print(AP_SSID);
   Serial.print(" @ ");
   Serial.println(WiFi.softAPIP());
@@ -535,6 +523,13 @@ void loop()
   {
     Serial.print("Invalid product index from HMI: ");
     Serial.println(address[1]);
+    resetRegisters();
+  }
+
+  // Tank low: abort / block the transaction. HMI shows "Refilling..." via address[27].
+  if (address[0] == 1 && refilling)
+  {
+    Serial.println("Transaction blocked: tank refilling.");
     resetRegisters();
   }
 
@@ -672,6 +667,14 @@ bool cashPay()
       break;
     }
 
+    checkTankLevel();
+    if (refilling)
+    {
+      Serial.println("Transaction aborted: tank low while waiting for coins.");
+      cancelled = true;
+      break;
+    }
+
     if (coinInserted)
     {
       noInterrupts();
@@ -737,13 +740,13 @@ bool cashPay()
 
       while (localPulseCount < targetPulses)
       {
-        // Tank low? Pause pour until HIGH sensor is wet, then shift timeouts.
-        unsigned long paused = waitForRefill();
-        if (paused > 0)
+        // Tank low mid-pour: stop pump, abort transaction (no sale recorded).
+        checkTankLevel();
+        if (refilling)
         {
-          dispenseStartTime += paused;
-          lastPulseTime = millis();
-          lastLogTime = millis();
+          Serial.println("ERROR: Tank low during dispense - aborting");
+          dispenseFailed = true;
+          break;
         }
 
         int pinState = digitalRead(flowSensor);
@@ -856,6 +859,12 @@ bool gcashPay()
   {
     if (address[0] == 0)
       break;
+    checkTankLevel();
+    if (refilling)
+    {
+      Serial.println("Transaction aborted: tank low while waiting for payment.");
+      break;
+    }
     processSMS();
     Serial.print("Current credited currency: PHP ");
     Serial.println(currency, 2);
@@ -897,13 +906,13 @@ bool gcashPay()
 
       while (localPulseCount < targetPulses)
       {
-        // Tank low? Pause pour until HIGH sensor is wet, then shift timeouts.
-        unsigned long paused = waitForRefill();
-        if (paused > 0)
+        // Tank low mid-pour: stop pump, abort transaction (no sale recorded).
+        checkTankLevel();
+        if (refilling)
         {
-          dispenseStartTime += paused;
-          lastPulseTime = millis();
-          lastLogTime = millis();
+          Serial.println("ERROR: Tank low during dispense - aborting");
+          dispenseFailed = true;
+          break;
         }
 
         int pinState = digitalRead(flowSensor);

@@ -253,11 +253,13 @@ address[27] = reserved for the next feature (spec pending). User does HMI side.
 GSM 16/17 · RS232/HMI 18/19 · coinslot 23 · slot relay 25 · booster relay 26 ·
 flow 27 · **water level LOW = 32, HIGH = 33** (new). Code pins already match except 32/33.
 
-## Behaviour (user spec)
-- If LOW sensor reads dry -> pause transaction, relay OFF, HMI shows "Refilling..."
-- Wait until HIGH sensor reads wet (hysteresis: don't resume at LOW, resume at HIGH)
-- Then resume dispense where it left off (pulse count kept), relay ON
-- Otherwise continue normally
+## Behaviour (user spec, REVISED 18 Aug after bench test)
+- Pins 32/33 are water INDICATORS: read HIGH when on (= no water at that level).
+- LOW indicator on -> `refilling` = true -> HMI shows "Refilling..." (address[27]=1)
+- While refilling: running transaction is ABORTED (pump off, resetRegisters, no
+  sale), coin wait / payment wait exit, no new transaction can start.
+- HIGH indicator off -> `refilling` = false -> back to normal, customer triggers again.
+- (First version paused-and-resumed the pour; that froze the HMI flow -> replaced.)
 
 ## Tasks
 - [x] 1. `#define levelLow 32`, `#define levelHigh 33`; `pinMode(..., INPUT_PULLUP)` in setup()
