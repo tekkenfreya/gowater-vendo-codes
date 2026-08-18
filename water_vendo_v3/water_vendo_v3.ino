@@ -1,4 +1,4 @@
-// water_vendo_v2.ino — new vendo build (18 Aug 2026)
+// water_vendo_v3.ino — new vendo build (18 Aug 2026)
 // Based on water_vendo_vigan.ino + pin remap (HMI 18/19, GSM 16/17), editable
 // PPL (address[24]), admin free-dispense (address[26]), tank level sensors
 // (32/33 -> address[27] "Refilling..."), scan fixes. PayMongo SMS credit removed.
@@ -18,9 +18,10 @@
 #define SIMTX 17
 #define levelLow 32   // tank LOW float switch
 #define levelHigh 33  // tank HIGH float switch
-// Float switch reading that means "no water at this sensor". Flip to HIGH if
-// the switches read inverted on hardware.
-#define LEVEL_DRY LOW
+// Pin reading that means the water indicator is ON (= no water at that level).
+// Bench 18 Aug: it dispensed while both indicators were on with LOW here, so on
+// this hardware "on" reads HIGH. Flip back to LOW if the wiring changes.
+#define LEVEL_DRY HIGH
 
 // Slots 26 (admin free-dispense toggle) and 27 (tank refilling flag) added on top of the
 // original 0-25 HMI map. address[24]=calibration, address[25]=login.

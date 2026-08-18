@@ -247,7 +247,7 @@ address[27] = reserved for the next feature (spec pending). User does HMI side.
 
 ---
 
-# Water level sensor: pause dispense + "Refilling..." (water_vendo_v2.ino)
+# Water level sensor: pause dispense + "Refilling..." (water_vendo_v3.ino)
 
 ## Wiring (new setup, confirmed 18 Aug 2026)
 GSM 16/17 · RS232/HMI 18/19 · coinslot 23 · slot relay 25 · booster relay 26 ·
@@ -278,7 +278,7 @@ flow 27 · **water level LOW = 32, HIGH = 33** (new). Code pins already match ex
 
 ---
 
-# Code scan fixes (water_vendo_v2.ino) — 18 Aug 2026
+# Code scan fixes (water_vendo_v3.ino) — 18 Aug 2026
 
 - [x] 1. REMOVED PayMongo SMS crediting (`extractAmount`, `testExtractAmount`, PAYMONGO branch). GCash credit will come from an API method later; `gcashPay()` kept as the placeholder.
 - [x] 2. Cancelled / failed transaction no longer recorded as a sale — `cashPay()` / `gcashPay()` now return `bool dispensed`; `loop()` records only when true.
@@ -290,5 +290,5 @@ flow 27 · **water level LOW = 32, HIGH = 33** (new). Code pins already match ex
 - [ ] 8. GSM → HardwareSerial `Serial2` — DEFERRED (no benefit until GSM carries payments/API).
 
 > **18 Aug 2026:** all of the above (pin remap, editable PPL, admin mode, scan fixes,
-> tank level) now lives in **`water_vendo_v2.ino`** — the NEW vendo build.
+> tank level) now lives in **`water_vendo_v3.ino`** — the NEW vendo build.
 > `water_vendo_vigan.ino` was restored to the committed version (old vendo, HMI on 16/17).
