@@ -1,9 +1,11 @@
 // water_vendo_v3.ino — new vendo build (18 Aug 2026)
 // Based on water_vendo_vigan.ino + pin remap (HMI 18/19, GSM 16/17), editable
 // PPL (address[24]), admin free-dispense (address[26]), tank level sensors
-// (32/33 -> address[27] "Refilling..."), scan fixes. PayMongo SMS credit removed.
+// (32/33 -> address[27] "Refilling..."), scan fixes. GCash payment via SMS to
+// the machine's own SIM (the number registered to the receiving GCash account):
+// GSM on hardware UART2 + non-blocking line parser, credit lands as soon as the
+// GCash "you have received" text arrives.
 #include <ModbusRTUSlave.h>
-#include <SoftwareSerial.h>
 #include <Preferences.h>
 #include <WiFi.h>
 #include <WebServer.h>
@@ -46,11 +48,26 @@ WebServer server(80);
 // ==========================================
 
 ModbusRTUSlave hmi(Serial1);
-SoftwareSerial gsm(SIMRX, SIMTX);
+// GSM on hardware UART2 — pins 16/17 are the native U2 pins. Hardware RX FIFO +
+// enlarged buffer means pushed SMS (+CMT) queue up even while a dispense loop or
+// the Modbus task is busy; SoftwareSerial dropped chars here and lost payments.
+HardwareSerial &gsm = Serial2;
 Preferences prefs;
 
 String senderNumber = "";
 double currency = 0.00;
+
+// GCash credit received via SMS. Kept SEPARATE from `currency` (coins) so it
+// survives resetRegisters() — a text that lands after a cancelled/timed-out
+// attempt still pays for the customer's next try. Consumed only when water is
+// actually dispensed; overpay remainder stays for the next purchase.
+// Not persisted to NVS: a power cycle loses unconsumed credit (accepted).
+double gcashCredit = 0.00;
+
+// Non-blocking GSM line parser state (see processSMS()).
+String gsmLine = "";        // characters of the line currently arriving
+String smsSender = "";      // sender from the last +CMT: header
+int smsBodyLinesLeft = 0;   // >0 while the next line(s) are that SMS's body
 
 // Authorized admin numbers for SMS commands (sales/reset)
 const String ADMIN_NUMBER_1 = "+639683597760";
@@ -94,10 +111,6 @@ float PULSES_PER_LITER = 450.0;
 
 // Debounce delay - reduce if missing pulses at high flow rates (try 1-5ms)
 const unsigned long flowDebounceDelay = 2;
-
-const unsigned long smsIntervalSecs = 60;
-unsigned long smsCheckTimer = 0;
-unsigned long lastSMSCheck = 0;
 
 int saleCounts[NUM_PRODUCTS + 1] = {0}; // index 1 to NUM_PRODUCTS
 int totalLiters = 0, totalRevenue = 0, totalTransactions = 0;
@@ -429,7 +442,8 @@ void setup()
 {
   Serial.begin(9600);
   Serial1.begin(9600, SERIAL_8N1, RX, TX);
-  gsm.begin(9600);
+  gsm.setRxBufferSize(1024); // must be set BEFORE begin(); holds pushed SMS while busy
+  gsm.begin(9600, SERIAL_8N1, SIMRX, SIMTX);
   hmi.begin(1, 9600, SERIAL_8N1);
   hmi.configureHoldingRegisters(address, regs);
 
@@ -493,8 +507,8 @@ void setup()
 
 void loop()
 {
-  // Web admin only runs when no transaction is active, to avoid disturbing
-  // the SoftwareSerial GSM timing during coin/SMS/dispense flow.
+  // Web admin only runs when no transaction is active, to keep the coin /
+  // dispense flow timing clean (GSM is on hardware UART now and doesn't care).
   if (address[0] == 0)
   {
     server.handleClient();
@@ -567,11 +581,9 @@ void loop()
 
   digitalWrite(relay, LOW);
 
-  if (millis() - lastSMSCheck > 15000)
-  {
-    lastSMSCheck = millis();
-    processSMS();
-  }
+  // Non-blocking — drains whatever GSM bytes arrived and returns. Runs every
+  // pass so a GCash text is credited the moment it finishes arriving.
+  processSMS();
 }
 
 // The rest of your existing functions stay the same
@@ -852,7 +864,9 @@ bool cashPay()
 }
 
 // Returns true only if water was dispensed (so loop() can record the sale).
-// GCash crediting via SMS was removed; an API-based method will set `currency`.
+// Waits for GCash credit from SMS (processSMS() -> gcashCredit). The credit is
+// consumed only here, when the pour actually starts; until then it survives
+// cancels and timeouts. Overpay remainder is kept for the next purchase.
 bool gcashPay()
 {
   for (;;)
@@ -866,20 +880,31 @@ bool gcashPay()
       break;
     }
     processSMS();
-    Serial.print("Current credited currency: PHP ");
-    Serial.println(currency, 2);
     if (address[0] == 0)
       break;
-    if (currency >= prices[address[1]])
+    if (currency + gcashCredit >= prices[address[1]])
     {
+      // Consume the credit (admin mode pre-loads `currency`, so `need` is 0 there).
+      double need = prices[address[1]] - currency;
+      if (need > 0)
+      {
+        gcashCredit -= need;
+        if (gcashCredit < 0) gcashCredit = 0;
+        currency = prices[address[1]];
+      }
+      Serial.print("GCash payment complete. Leftover credit: PHP ");
+      Serial.println(gcashCredit, 2);
+
+      // Short "payment received" screen walk — was 6s of delays, which sat on
+      // top of the carrier's own SMS delay. HMI polls fast enough for 300ms steps.
       address[3] = 6;
-      delay(3000);
+      delay(300);
       address[3] = 7;
-      delay(1000);
+      delay(300);
       address[3] = 8;
-      delay(1000);
+      delay(300);
       address[3] = 9;
-      delay(1000);
+      delay(300);
 
       // Volume-based dispensing using polled pulse counting (no ISR)
       detachInterrupt(digitalPinToInterrupt(flowSensor));
@@ -1065,27 +1090,58 @@ bool isAuthorizedSender(String number)
   return false;
 }
 
-void extractSenderInfo(String sms)
+// Pull the sender out of a `+CMT: "<sender>",...` header line.
+// For GCash this is the alphanumeric sender ID "GCash", not a phone number.
+String extractSender(const String &header)
 {
-  senderNumber = "";
-  int startIndex = sms.indexOf("+CMT: \"");
-  if (startIndex != -1)
-  {
-    int endIndex = sms.indexOf("\"", startIndex + 7);
-    if (endIndex != -1)
-    {
-      senderNumber = sms.substring(startIndex + 7, endIndex);
-    }
-  }
-  if (senderNumber.length() > 0)
-  {
-    Serial.print("Sender: ");
-    Serial.println(senderNumber);
-  }
+  int startIndex = header.indexOf("+CMT: \"");
+  if (startIndex == -1)
+    return "";
+  int endIndex = header.indexOf("\"", startIndex + 7);
+  if (endIndex == -1)
+    return "";
+  return header.substring(startIndex + 7, endIndex);
+}
+
+// Parse the peso amount out of a GCash "you have received" text.
+// Matches "PHP 20.00", "P20.00", "P 1,000.00" (commas stripped). Returns 0 on
+// no match. Template to be confirmed against the raw log on the live P1 test.
+float extractAmount(const String &body)
+{
+  int start = -1;
+  int idx = body.indexOf("PHP");
+  if (idx >= 0)
+    start = idx + 3;
   else
   {
-    Serial.println("Failed to extract sender information.");
+    // Fallback: "P" directly followed by the amount (optionally one space).
+    for (int i = 0; i < (int)body.length() - 1; i++)
+    {
+      if ((body.charAt(i) == 'P' || body.charAt(i) == 'p') &&
+          (isdigit(body.charAt(i + 1)) ||
+           (body.charAt(i + 1) == ' ' && i + 2 < (int)body.length() && isdigit(body.charAt(i + 2)))))
+      {
+        start = i + 1;
+        break;
+      }
+    }
   }
+  if (start < 0)
+    return 0.0;
+
+  while (start < (int)body.length() && isspace(body.charAt(start)))
+    start++;
+
+  String amt = "";
+  for (int i = start; i < (int)body.length(); i++)
+  {
+    char c = body.charAt(i);
+    if (isdigit(c) || c == '.')
+      amt += c;
+    else if (c != ',') // skip thousands separators
+      break;
+  }
+  return amt.toFloat();
 }
 
 bool isNumeric(String str)
@@ -1100,52 +1156,102 @@ bool isNumeric(String str)
   return true;
 }
 
+// Handle one line of SMS body from `sender`. Returns true once it acted
+// (credited a payment or ran an admin command) so the caller can stop treating
+// further lines as this message's body.
+bool handleSMSBody(const String &sender, const String &body)
+{
+  // GCash payment notification (sender ID "GCash", not a number).
+  if (sender.equalsIgnoreCase("GCash"))
+  {
+    // Only credit "received" texts — GCash also sends texts for money SENT
+    // from this account, balance reminders, promos, etc.
+    String lower = body;
+    lower.toLowerCase();
+    if (lower.indexOf("receive") == -1)
+      return false;
+    float val = extractAmount(body);
+    if (val > 0.0)
+    {
+      gcashCredit += val;
+      Serial.print("GCash credited: PHP ");
+      Serial.print(val, 2);
+      Serial.print(" | total credit: PHP ");
+      Serial.println(gcashCredit, 2);
+      return true;
+    }
+    return false;
+  }
+
+  // Admin SMS commands (sales / reset) from authorized numbers.
+  String lower = body;
+  lower.toLowerCase();
+  if (lower.indexOf("sales") != -1)
+  {
+    if (isAuthorizedSender(sender))
+      sendSalesSMS(sender);
+    else
+      Serial.println("Unauthorized sales request from: " + sender);
+    return true;
+  }
+  if (lower.indexOf("reset") != -1)
+  {
+    if (isAuthorizedSender(sender))
+      resetSalesSMS(sender);
+    else
+      Serial.println("Unauthorized reset request from: " + sender);
+    return true;
+  }
+  return false;
+}
+
+// Non-blocking GSM reader. Drains the UART FIFO, assembles complete lines, and
+// reacts the instant a pushed SMS (+CMT header + body, CNMI=2,2) is complete.
+// Replaces the old readString() approach, which blocked ~1s and split messages
+// (a botched read = payment lost, since 2,2 doesn't store the SMS on the SIM).
 void processSMS()
 {
-  int availableBytes = gsm.available();
-  Serial.print("Bytes available in SMS buffer: ");
-  Serial.println(availableBytes);
-  if (availableBytes > 0)
+  while (gsm.available())
   {
-    String sms = gsm.readString();
-    Serial.println("Received SMS: ");
-    Serial.println(sms);
-    extractSenderInfo(sms);
-    sms.toLowerCase(); // normalize to lowercase
+    char c = gsm.read();
+    if (c == '\r')
+      continue;
+    if (c != '\n')
+    {
+      gsmLine += c;
+      if (gsmLine.length() > 360) // runaway guard (max multipart SMS chunk is ~153 chars)
+        gsmLine = "";
+      continue;
+    }
 
-    // Admin SMS commands only (sales / reset). GCash payment crediting via
-    // SMS was removed — to be replaced by an API-based method.
-    if (sms.indexOf("sales") != -1)
+    String line = gsmLine;
+    gsmLine = "";
+    if (line.length() == 0)
+      continue;
+    Serial.println("GSM: " + line);
+
+    if (line.startsWith("+CMT:"))
     {
-      if (isAuthorizedSender(senderNumber))
-      {
-        sendSalesSMS(senderNumber);
-      }
-      else
-      {
-        Serial.println("Unauthorized sales request from: " + senderNumber);
-      }
+      smsSender = extractSender(line);
+      senderNumber = smsSender; // kept for sendSalesSMS/reset replies
+      // Body is normally the single next line; allow a few in case the
+      // template ever wraps. Any other URC ("+...") ends the body early.
+      smsBodyLinesLeft = 4;
+      continue;
     }
-    else if (sms.indexOf("reset") != -1)
+
+    if (line.charAt(0) == '+') // unrelated URC (+CREG, +CSQ, ...) ends any open body
     {
-      if (isAuthorizedSender(senderNumber))
-      {
-        resetSalesSMS(senderNumber);
-      }
-      else
-      {
-        Serial.println("Unauthorized reset request from: " + senderNumber);
-      }
+      smsBodyLinesLeft = 0;
+      continue;
     }
-    else
+
+    if (smsBodyLinesLeft > 0)
     {
-      Serial.print("Ignoring SMS from unauthorized sender: ");
-      Serial.println(senderNumber);
+      smsBodyLinesLeft--;
+      if (handleSMSBody(smsSender, line))
+        smsBodyLinesLeft = 0;
     }
-  }
-  else
-  {
-    Serial.println("No new SMS data available.");
   }
 }
 

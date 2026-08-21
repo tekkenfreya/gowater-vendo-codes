@@ -291,6 +291,48 @@ flow 27 · **water level LOW = 32, HIGH = 33** (new). Code pins already match ex
 - [x] 7. `syncPulsesPerLiter()` moved from HMICon task to `loop()` (idle only) — single-task NVS access.
 - [ ] 8. GSM → HardwareSerial `Serial2` — DEFERRED (no benefit until GSM carries payments/API).
 
+# GCash payment via SMS — fast this time (water_vendo_v3.ino) — 19 Aug 2026
+
+## Why the old SMS flow was slow
+1. `gsm.readString()` fires on the FIRST byte then blocks ~1s (Stream timeout); at
+   9600 baud the +CMT arrives split → partial parse → and with CNMI=2,2 the message
+   is not stored on SIM, so a botched read = payment LOST, not late.
+2. SoftwareSerial on ESP32 drops RX chars while Modbus HMI task / web server /
+   dispense loops run → corrupted messages → missed credits.
+3. 6s of hard-coded HMI ceremony (3000+1000+1000+1000) between credit and pump-on.
+Carrier delay on the GCash SMS itself (2-15s) is fixed cost; goal = add ~1s on top, lose nothing.
+
+## Plan
+- [x] 1. GSM → HardwareSerial `Serial2` (pins 16/17 ARE the native UART2 pins — near drop-in).
+      `gsm.setRxBufferSize(1024)` before begin. SoftwareSerial include + object deleted.
+      (Old deferred task #8 — done.)
+- [x] 2. `processSMS()` is now a non-blocking line accumulator: drains the FIFO, assembles
+      lines, `+CMT:` header saves sender, following line(s) are the body (max 4, any other
+      `+` URC ends the body early). No blocking timeout, no split-message losses.
+- [x] 3. GCash crediting restored: sender ID `GCash` (case-insensitive) + body must contain
+      "receive" (so sent-money/promo texts don't credit) → `extractAmount()` (handles
+      "PHP 20.00", "P20", "P 1,000.00") → `gcashCredit += amt`. Admin `sales`/`reset` kept.
+      Raw GSM line logging kept for the live-test template check.
+- [x] 4. Parser runs every `loop()` pass (15s gate + `lastSMSCheck`/`smsCheckTimer` removed)
+      and inside the `gcashPay()` wait loop.
+- [x] 5. Post-credit ceremony in `gcashPay()`: 6s → 1.2s (4 × 300ms screen steps).
+- [x] 6. Credit lives in NEW `gcashCredit` var, separate from `currency` (coins), so
+      `resetRegisters()` never wipes it. Consumed only when the pour starts; overpay
+      remainder carries to the next purchase. Not NVS-persisted (power cycle loses it).
+- [ ] 7. Live ₱1 test on hardware (your turn): confirm real GCash SMS sender ID + template
+      from the raw log, adjust `extractAmount` match if wording differs, measure
+      pay→pour time.
+
+## Notes
+- CNMI=2,2 (direct push) is KEPT — fastest path; hardware UART FIFO removes the
+  lost-message risk that made 2,2 dangerous with SoftwareSerial.
+- One SIM per machine → credit any GCash received amount; no exact-centavo scheme needed.
+- No HMI register changes. No web admin changes.
+- 19 Aug: implemented, compiles clean on ESP32 core 2.0.17 (797KB / 60% flash).
+  Only remaining item is #7 — the live ₱1 test.
+
+---
+
 > **18 Aug 2026:** all of the above (pin remap, editable PPL, admin mode, scan fixes,
 > tank level) now lives in **`water_vendo_v3.ino`** — the NEW vendo build.
 > `water_vendo_vigan.ino` was restored to the committed version (old vendo, HMI on 16/17).
